@@ -1,0 +1,48 @@
+{
+  "manifest_version": 3,
+  "name": "Hitomi Auto Downloader",
+  "version": "1.0.0",
+  "description": "hitomi.laの全タブでダウンロードボタンを自動クリックし、進捗を管理",
+  "permissions": [
+    "tabs",
+    "downloads",
+    "activeTab",
+    "scripting"
+  ],
+  "host_permissions": [
+    "*://hitomi.la/*"
+  ],
+  "action": {
+    "default_popup": "popup/popup.html",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "background": {
+    "service_worker": "scripts/background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["*://hitomi.la/*"],
+      "js": ["scripts/content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "commands": {
+    "download-all": {
+      "suggested_key": {
+        "default": "Alt+Shift+D",
+        "windows": "Alt+Shift+D",
+        "mac": "Alt+Shift+D"
+      },
+      "description": "全てのhitomi.laタブでダウンロードを開始"
+    }
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  }
+}

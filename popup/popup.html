@@ -1,0 +1,66 @@
+<!DOCTYPE html>
+<html lang="ja">
+
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Hitomi Auto Downloader</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+
+<body>
+  <div class="container">
+    <header>
+      <h1>📥 Hitomi Auto Downloader</h1>
+    </header>
+
+    <section class="controls">
+      <button id="startDownload" class="btn btn-primary">
+        <span class="icon">▶</span>
+        全タブでダウンロード開始
+      </button>
+      <button id="refreshStatus" class="btn btn-secondary">
+        <span class="icon">🔄</span>
+        ステータス更新
+      </button>
+      <button id="retryDownload" class="btn btn-warning">
+        <span class="icon">🔁</span>
+        未完了を再ダウンロード
+      </button>
+    </section>
+
+    <section class="stats">
+      <div class="stat-item">
+        <span class="stat-label">対象タブ</span>
+        <span id="totalTabs" class="stat-value">0</span>
+      </div>
+      <div class="stat-item">
+        <span class="stat-label">完了</span>
+        <span id="completedCount" class="stat-value complete">0</span>
+      </div>
+      <div class="stat-item">
+        <span class="stat-label">進行中</span>
+        <span id="inProgressCount" class="stat-value in-progress">0</span>
+      </div>
+      <div class="stat-item">
+        <span class="stat-label">エラー</span>
+        <span id="errorCount" class="stat-value error">0</span>
+      </div>
+    </section>
+
+    <section class="tab-list">
+      <h2>タブ一覧</h2>
+      <ul id="tabList">
+        <li class="empty-state">対象タブがありません</li>
+      </ul>
+    </section>
+
+    <footer>
+      <p class="shortcut-hint">ショートカット: <kbd>Alt</kbd>+<kbd>Shift</kbd>+<kbd>D</kbd></p>
+    </footer>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+
+</html>
