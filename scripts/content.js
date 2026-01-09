@@ -1,10 +1,10 @@
 // Content Script - runs on hitomi.la pages
-// Updated with verified selectors from browser analysis
+// シンプル版 - 進捗監視はバックグラウンドで行う
 
 // Report ready status to background
 chrome.runtime.sendMessage({ type: 'CONTENT_READY', url: window.location.href });
 
-// Listen for click commands from background/popup
+// Listen for commands from background
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (message.type === 'CLICK_DOWNLOAD') {
         const result = findAndClickDownload();
@@ -20,12 +20,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
 /**
  * Find and click the download button
- * Based on verified analysis: #dl-button (a tag with h1 "Download" inside)
  */
 function findAndClickDownload() {
     console.log('[Hitomi Downloader] Searching for download button...');
 
-    // Priority 1: Direct ID selector (verified from browser analysis)
+    // Priority 1: Direct ID selector
     const dlButton = document.getElementById('dl-button');
     if (dlButton) {
         const rect = dlButton.getBoundingClientRect();
@@ -35,10 +34,6 @@ function findAndClickDownload() {
         if (isVisible && displayStyle !== 'none') {
             console.log('[Hitomi Downloader] Found #dl-button, clicking...');
             dlButton.click();
-
-            // Start monitoring progress
-            startProgressMonitor();
-
             chrome.runtime.sendMessage({ type: 'DOWNLOAD_CLICKED' });
             return { success: true, method: 'id', element: '#dl-button' };
         } else {
@@ -62,7 +57,6 @@ function findAndClickDownload() {
         if (parentLink) {
             console.log('[Hitomi Downloader] Found download link via h1...');
             parentLink.click();
-            startProgressMonitor();
             chrome.runtime.sendMessage({ type: 'DOWNLOAD_CLICKED' });
             return { success: true, method: 'h1', element: 'a > h1' };
         }
@@ -77,7 +71,6 @@ function findAndClickDownload() {
             if (rect.width > 0 && rect.height > 0) {
                 console.log('[Hitomi Downloader] Found by text:', element);
                 element.click();
-                startProgressMonitor();
                 chrome.runtime.sendMessage({ type: 'DOWNLOAD_CLICKED' });
                 return { success: true, method: 'text', element: element.tagName };
             }
@@ -92,7 +85,7 @@ function findAndClickDownload() {
 }
 
 /**
- * Check download progress using #progressbar
+ * Check download progress - called by background via polling
  */
 function checkDownloadProgress() {
     const progressbar = document.getElementById('progressbar');
@@ -103,83 +96,30 @@ function checkDownloadProgress() {
         const progressValue = parseInt(value || '0', 10);
         const isVisible = window.getComputedStyle(progressbar).display !== 'none';
 
-        return {
-            status: 'downloading',
-            progress: progressValue,
-            visible: isVisible
-        };
+        if (isVisible) {
+            return {
+                status: 'downloading',
+                progress: progressValue,
+                dlButtonVisible: false
+            };
+        }
     }
 
     // If no progress bar but button is visible, download might be complete or not started
     if (dlButton) {
         const isVisible = window.getComputedStyle(dlButton).display !== 'none';
         if (isVisible) {
-            return { status: 'ready', progress: 0 };
+            return { status: 'ready', progress: 0, dlButtonVisible: true };
         }
     }
 
-    return { status: 'unknown', progress: 0 };
-}
-
-/**
- * Monitor progress and report completion
- */
-let progressMonitorInterval = null;
-
-function startProgressMonitor() {
-    if (progressMonitorInterval) {
-        clearInterval(progressMonitorInterval);
-    }
-
-    let lastProgress = 0;
-    let downloadStarted = false;
-
-    progressMonitorInterval = setInterval(() => {
-        const progressbar = document.getElementById('progressbar');
-        const dlButton = document.getElementById('dl-button');
-
-        if (progressbar) {
-            downloadStarted = true;
-            const progress = parseInt(progressbar.getAttribute('aria-valuenow') || '0', 10);
-
-            if (progress !== lastProgress) {
-                lastProgress = progress;
-                chrome.runtime.sendMessage({
-                    type: 'DOWNLOAD_PROGRESS',
-                    progress: progress
-                });
-                console.log(`[Hitomi Downloader] Progress: ${progress}%`);
-            }
-
-            if (progress >= 100) {
-                // Wait a bit for the actual download to complete
-                setTimeout(() => {
-                    chrome.runtime.sendMessage({ type: 'DOWNLOAD_COMPLETE' });
-                    clearInterval(progressMonitorInterval);
-                    progressMonitorInterval = null;
-                }, 2000);
-            }
-        } else if (downloadStarted) {
-            // Progress bar disappeared - download complete
-            chrome.runtime.sendMessage({ type: 'DOWNLOAD_COMPLETE' });
-            clearInterval(progressMonitorInterval);
-            progressMonitorInterval = null;
-        }
-    }, 1000);
-
-    // Safety timeout - stop monitoring after 10 minutes
-    setTimeout(() => {
-        if (progressMonitorInterval) {
-            clearInterval(progressMonitorInterval);
-            progressMonitorInterval = null;
-        }
-    }, 600000);
+    // Neither visible - likely complete
+    return { status: 'complete', progress: 100, dlButtonVisible: false };
 }
 
 // Export for debugging
 window.__hitomiDownloader = {
     findAndClickDownload,
     checkDownloadProgress,
-    startProgressMonitor,
-    version: '1.1.0'
+    version: '2.0.0'
 };

@@ -1,7 +1,7 @@
 // Popup UI Logic
 document.addEventListener('DOMContentLoaded', init);
 
-// State
+// State (view only - actual state is in background)
 let tabsState = new Map();
 
 async function init() {
@@ -23,6 +23,10 @@ async function init() {
 
 async function refreshTabList() {
   try {
+    // まずバックグラウンドから現在のステータスを取得
+    const statusResponse = await chrome.runtime.sendMessage({ type: 'GET_STATUS' });
+    const savedStatus = statusResponse?.downloads || {};
+
     const tabs = await chrome.tabs.query({
       currentWindow: true,
       url: '*://hitomi.la/*'
@@ -39,30 +43,23 @@ async function refreshTabList() {
         tab.url.includes('/imageset/'))
     );
 
-    // Update state
-    tabsState = new Map(contentTabs.map(tab => [
-      tab.id,
-      {
-        id: tab.id,
-        title: tab.title || 'Unknown',
-        url: tab.url,
-        status: 'pending',
-        details: ''
-      }
-    ]));
+    // Update state - 保存されたステータスがあれば使用
+    tabsState = new Map(contentTabs.map(tab => {
+      const saved = savedStatus[tab.id];
+      return [
+        tab.id,
+        {
+          id: tab.id,
+          title: tab.title || 'Unknown',
+          url: tab.url,
+          status: saved?.status || 'pending',
+          details: saved?.details || ''
+        }
+      ];
+    }));
 
     renderTabList();
     updateStats();
-
-    // Get current status from background
-    const response = await chrome.runtime.sendMessage({ type: 'GET_STATUS' });
-    if (response && response.downloads) {
-      for (const [tabId, status] of Object.entries(response.downloads)) {
-        if (tabsState.has(parseInt(tabId))) {
-          updateTabStatus(parseInt(tabId), status.status, status.details);
-        }
-      }
-    }
   } catch (error) {
     console.error('Failed to refresh tab list:', error);
   }

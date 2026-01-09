@@ -1,13 +1,14 @@
 {
   "manifest_version": 3,
   "name": "Hitomi Auto Downloader",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "description": "hitomi.laの全タブでダウンロードボタンを自動クリックし、進捗を管理",
   "permissions": [
     "tabs",
     "downloads",
     "activeTab",
-    "scripting"
+    "scripting",
+    "storage"
   ],
   "host_permissions": [
     "*://hitomi.la/*"
@@ -25,8 +26,12 @@
   },
   "content_scripts": [
     {
-      "matches": ["*://hitomi.la/*"],
-      "js": ["scripts/content.js"],
+      "matches": [
+        "*://hitomi.la/*"
+      ],
+      "js": [
+        "scripts/content.js"
+      ],
       "run_at": "document_idle"
     }
   ],
