@@ -1,5 +1,5 @@
 // Background Service Worker
-// v2.2.0 - タブとダウンロードIDの正確な紐付け
+// v2.3.0 - referrerを使った正確なタブ紐付け
 
 // ============================================
 // State Management
@@ -38,10 +38,20 @@ loadStateFromStorage();
 // URLからギャラリーIDを抽出
 function extractGalleryId(url) {
     if (!url) return null;
-    // hitomi.la/doujinshi/xxxxx-12345.html -> 12345
-    // hitomi.la/manga/title-here-67890.html -> 67890
     const match = url.match(/-(\d+)\.html/);
     return match ? match[1] : null;
+}
+
+// URL正規化（比較用）
+function normalizeUrl(url) {
+    if (!url) return '';
+    try {
+        const u = new URL(url);
+        // ハッシュとクエリを除去してパスのみで比較
+        return u.origin + u.pathname;
+    } catch (e) {
+        return url;
+    }
 }
 
 // ============================================
@@ -132,33 +142,78 @@ function addToMonitoring(tabId) {
 }
 
 // ============================================
-// Chrome Downloads API - 正確な紐付け
+// Chrome Downloads API - referrerで正確な紐付け
 // ============================================
 
 chrome.downloads.onCreated.addListener(async (downloadItem) => {
     console.log('[Background] Download created:', {
         id: downloadItem.id,
-        url: downloadItem.url?.substring(0, 100),
-        filename: downloadItem.filename
+        url: downloadItem.url?.substring(0, 80),
+        referrer: downloadItem.referrer,
+        filename: downloadItem.filename,
+        finalUrl: downloadItem.finalUrl
     });
 
-    // ダウンロードURLまたはファイル名からギャラリーIDを抽出
-    const downloadGalleryId = extractGalleryIdFromDownload(downloadItem);
+    const referrer = downloadItem.referrer;
+    const normalizedReferrer = normalizeUrl(referrer);
+
+    // 方法1: referrer URLでタブを照合
+    if (referrer && referrer.includes('hitomi.la')) {
+        for (const [tabId, state] of downloadState) {
+            if (state.status === 'in-progress' && !state.downloadId) {
+                const normalizedTabUrl = normalizeUrl(state.url);
+
+                if (normalizedTabUrl === normalizedReferrer) {
+                    state.downloadId = downloadItem.id;
+                    downloadState.set(tabId, state);
+                    await saveStateToStorage();
+                    console.log(`[Background] ✓ Matched by referrer: download ${downloadItem.id} -> tab ${tabId}`);
+                    console.log(`[Background]   referrer: ${referrer}`);
+                    console.log(`[Background]   tabUrl: ${state.url}`);
+                    return;
+                }
+            }
+        }
+
+        // ギャラリーIDで照合
+        const referrerGalleryId = extractGalleryId(referrer);
+        if (referrerGalleryId) {
+            for (const [tabId, state] of downloadState) {
+                if (state.status === 'in-progress' && !state.downloadId && state.galleryId === referrerGalleryId) {
+                    state.downloadId = downloadItem.id;
+                    downloadState.set(tabId, state);
+                    await saveStateToStorage();
+                    console.log(`[Background] ✓ Matched by galleryId: download ${downloadItem.id} -> tab ${tabId} (galleryId: ${referrerGalleryId})`);
+                    return;
+                }
+            }
+        }
+    }
+
+    // 方法2: ダウンロードURLやファイル名からギャラリーID抽出
+    let downloadGalleryId = null;
+    if (downloadItem.url) {
+        const urlMatch = downloadItem.url.match(/(\d{6,})/);
+        if (urlMatch) downloadGalleryId = urlMatch[1];
+    }
+    if (!downloadGalleryId && downloadItem.filename) {
+        const fnMatch = downloadItem.filename.match(/(\d{6,})/);
+        if (fnMatch) downloadGalleryId = fnMatch[1];
+    }
 
     if (downloadGalleryId) {
-        // ギャラリーIDで照合
         for (const [tabId, state] of downloadState) {
             if (state.status === 'in-progress' && !state.downloadId && state.galleryId === downloadGalleryId) {
                 state.downloadId = downloadItem.id;
                 downloadState.set(tabId, state);
                 await saveStateToStorage();
-                console.log(`[Background] Matched download ${downloadItem.id} to tab ${tabId} by galleryId ${downloadGalleryId}`);
+                console.log(`[Background] ✓ Matched by download galleryId: download ${downloadItem.id} -> tab ${tabId} (galleryId: ${downloadGalleryId})`);
                 return;
             }
         }
     }
 
-    // ギャラリーIDで照合できない場合、in-progressで最も古いタブに割り当て
+    // フォールバック: 最も古い未紐付けタブに割り当て
     let oldestTab = null;
     let oldestTime = Infinity;
 
@@ -176,25 +231,11 @@ chrome.downloads.onCreated.addListener(async (downloadItem) => {
         state.downloadId = downloadItem.id;
         downloadState.set(oldestTab, state);
         await saveStateToStorage();
-        console.log(`[Background] Fallback: Linked download ${downloadItem.id} to oldest tab ${oldestTab}`);
+        console.log(`[Background] ⚠ Fallback: download ${downloadItem.id} -> oldest tab ${oldestTab}`);
+    } else {
+        console.log(`[Background] ✗ No matching tab found for download ${downloadItem.id}`);
     }
 });
-
-function extractGalleryIdFromDownload(downloadItem) {
-    // URLからギャラリーID抽出を試みる
-    if (downloadItem.url) {
-        const urlMatch = downloadItem.url.match(/(\d{5,})/);
-        if (urlMatch) return urlMatch[1];
-    }
-
-    // ファイル名からギャラリーID抽出を試みる
-    if (downloadItem.filename) {
-        const filenameMatch = downloadItem.filename.match(/(\d{5,})/);
-        if (filenameMatch) return filenameMatch[1];
-    }
-
-    return null;
-}
 
 chrome.downloads.onChanged.addListener(async (delta) => {
     if (!delta.state) return;
@@ -202,12 +243,12 @@ chrome.downloads.onChanged.addListener(async (delta) => {
     for (const [tabId, state] of downloadState) {
         if (state.downloadId === delta.id) {
             if (delta.state.current === 'complete') {
-                console.log(`[Background] Download ${delta.id} complete for tab ${tabId}`);
+                console.log(`[Background] ✓ Download complete: ${delta.id} -> tab ${tabId} (${state.title})`);
                 updateTabState(tabId, 'complete', '');
                 monitoredTabs.delete(tabId);
                 await saveStateToStorage();
             } else if (delta.state.current === 'interrupted') {
-                console.log(`[Background] Download ${delta.id} interrupted for tab ${tabId}`);
+                console.log(`[Background] ✗ Download interrupted: ${delta.id} -> tab ${tabId}`);
                 updateTabState(tabId, 'error', delta.error?.current || 'ダウンロード中断');
                 monitoredTabs.delete(tabId);
                 await saveStateToStorage();
@@ -347,13 +388,13 @@ async function handleStartDownloads(tabIds, delay = 1000) {
                 title: tab.title,
                 galleryId: galleryId,
                 hadProgressBar: false,
-                startTime: Date.now()  // 開始時間を記録
+                startTime: Date.now()
             });
 
             broadcastStatusUpdate(tabId, 'in-progress', '処理中...');
             await saveStateToStorage();
 
-            console.log(`[Background] Starting download for tab ${tabId}, galleryId: ${galleryId}`);
+            console.log(`[Background] Starting tab ${tabId}: ${tab.title?.substring(0, 40)} (galleryId: ${galleryId})`);
 
             await chrome.scripting.executeScript({
                 target: { tabId: tabId },
