@@ -1,16 +1,14 @@
 // Background Service Worker
-// v2.4.0 - ファイル名とタブタイトルで照合
+// v2.5.0 - マッチングアルゴリズム修正
 
 // ============================================
 // State Management
 // ============================================
 
-let downloadState = new Map();  // tabId -> state
+let downloadState = new Map();
 let monitoredTabs = new Set();
 let progressPollingInterval = null;
-
-// 未紐付けダウンロードを追跡（後でファイル名が判明したときに照合）
-let unmatchedDownloads = new Map();  // downloadId -> downloadItem info
+let unmatchedDownloads = new Map();
 
 async function saveStateToStorage() {
     const stateObject = {};
@@ -36,6 +34,26 @@ async function loadStateFromStorage() {
 
 loadStateFromStorage();
 
+// ============================================
+// 文字列マッチング関数
+// ============================================
+
+// タイトルからサイト名を除去
+function cleanTitle(title) {
+    if (!title) return '';
+    // "タイトル | Hitomi.la" -> "タイトル"
+    // "タイトル by 作者 | Hitomi.la" -> "タイトル by 作者"
+    return title.replace(/\s*\|\s*Hitomi\.la.*$/i, '').trim();
+}
+
+// ファイル名からパスと拡張子を除去
+function cleanFilename(filepath) {
+    if (!filepath) return '';
+    // "F:\path\to\file.zip" -> "file"
+    const filename = filepath.split(/[\\\/]/).pop() || filepath;
+    return filename.replace(/\.zip$/i, '').trim();
+}
+
 // ギャラリーIDを抽出
 function extractGalleryId(url) {
     if (!url) return null;
@@ -43,40 +61,83 @@ function extractGalleryId(url) {
     return match ? match[1] : null;
 }
 
-// 文字列の類似度を計算（簡易版）
-function getMatchScore(str1, str2) {
-    if (!str1 || !str2) return 0;
+// 正規化して比較
+function normalizeForComparison(str) {
+    if (!str) return '';
+    // 小文字化、特殊文字除去、スペース正規化
+    return str
+        .toLowerCase()
+        .replace(/[「」『』【】\[\]()（）\{\}<>《》♡♥★☆]/g, '')
+        .replace(/[.\-_～~→]/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+}
 
-    const s1 = str1.toLowerCase();
-    const s2 = str2.toLowerCase();
+// 二つの文字列がどれだけ類似しているかを判定
+function calculateMatchScore(filename, tabTitle, galleryId) {
+    const cleanedFilename = cleanFilename(filename);
+    const cleanedTitle = cleanTitle(tabTitle);
 
-    // 完全一致
-    if (s1 === s2) return 100;
+    console.log(`[Background]     filename: "${cleanedFilename}"`);
+    console.log(`[Background]     title: "${cleanedTitle}"`);
+    console.log(`[Background]     galleryId: "${galleryId}"`);
 
-    // 含有チェック
-    if (s1.includes(s2) || s2.includes(s1)) return 80;
-
-    // 数字部分（ギャラリーID）の一致
-    const nums1 = s1.match(/\d{5,}/g) || [];
-    const nums2 = s2.match(/\d{5,}/g) || [];
-
-    for (const n1 of nums1) {
-        if (nums2.includes(n1)) return 90;
+    // 1. ギャラリーIDがファイル名に含まれる場合は最高スコア
+    if (galleryId && (filename.includes(galleryId) || cleanedFilename.includes(galleryId))) {
+        console.log(`[Background]     → galleryId match in filename`);
+        return 100;
     }
 
-    // 単語の重なり
-    const words1 = s1.split(/[\s\-_\[\]()]+/).filter(w => w.length > 2);
-    const words2 = s2.split(/[\s\-_\[\]()]+/).filter(w => w.length > 2);
+    // 2. 完全一致チェック
+    if (cleanedFilename === cleanedTitle) {
+        console.log(`[Background]     → exact match`);
+        return 100;
+    }
+
+    // 3. 正規化して比較
+    const normFilename = normalizeForComparison(cleanedFilename);
+    const normTitle = normalizeForComparison(cleanedTitle);
+
+    if (normFilename === normTitle) {
+        console.log(`[Background]     → normalized exact match`);
+        return 95;
+    }
+
+    // 4. 含有チェック
+    if (normFilename.includes(normTitle) || normTitle.includes(normFilename)) {
+        console.log(`[Background]     → contains match`);
+        return 90;
+    }
+
+    // 5. 先頭N文字の一致チェック
+    const minLen = Math.min(normFilename.length, normTitle.length);
+    const compareLen = Math.min(minLen, 20);  // 最初の20文字
+
+    if (compareLen > 5) {
+        const prefixFilename = normFilename.substring(0, compareLen);
+        const prefixTitle = normTitle.substring(0, compareLen);
+
+        if (prefixFilename === prefixTitle) {
+            console.log(`[Background]     → prefix match (${compareLen} chars)`);
+            return 85;
+        }
+    }
+
+    // 6. 単語ベースの類似度
+    const words1 = normFilename.split(' ').filter(w => w.length > 1);
+    const words2 = normTitle.split(' ').filter(w => w.length > 1);
 
     let matchCount = 0;
     for (const w1 of words1) {
-        if (words2.some(w2 => w1.includes(w2) || w2.includes(w1))) {
+        if (words2.some(w2 => w1 === w2 || w1.includes(w2) || w2.includes(w1))) {
             matchCount++;
         }
     }
 
-    if (words1.length > 0) {
-        return Math.round((matchCount / words1.length) * 70);
+    if (words1.length > 0 && matchCount > 0) {
+        const wordScore = Math.round((matchCount / words1.length) * 70);
+        console.log(`[Background]     → word match: ${matchCount}/${words1.length} = ${wordScore}`);
+        return Math.max(wordScore, 30);  // 最低30
     }
 
     return 0;
@@ -84,34 +145,20 @@ function getMatchScore(str1, str2) {
 
 // ダウンロードとタブをマッチング
 async function matchDownloadToTab(downloadId, filename, url) {
-    console.log(`[Background] Trying to match download ${downloadId}: "${filename}"`);
+    console.log(`[Background] === Matching download ${downloadId} ===`);
+    console.log(`[Background] Filename: "${filename}"`);
 
     let bestMatch = null;
     let bestScore = 0;
 
     for (const [tabId, state] of downloadState) {
         if (state.status !== 'in-progress') continue;
-        if (state.downloadId) continue;  // 既に紐付け済み
+        if (state.downloadId) continue;
 
-        // スコア計算
-        let score = 0;
+        console.log(`[Background]   Checking tab ${tabId}: "${state.title?.substring(0, 50)}"`);
 
-        // ファイル名とタブタイトルを比較
-        if (filename && state.title) {
-            score = Math.max(score, getMatchScore(filename, state.title));
-        }
-
-        // ギャラリーIDで比較
-        if (state.galleryId) {
-            if (filename && filename.includes(state.galleryId)) {
-                score = Math.max(score, 95);
-            }
-            if (url && url.includes(state.galleryId)) {
-                score = Math.max(score, 95);
-            }
-        }
-
-        console.log(`[Background]   Tab ${tabId} (${state.title?.substring(0, 30)}): score=${score}`);
+        const score = calculateMatchScore(filename, state.title, state.galleryId);
+        console.log(`[Background]   → Score: ${score}`);
 
         if (score > bestScore) {
             bestScore = score;
@@ -119,16 +166,17 @@ async function matchDownloadToTab(downloadId, filename, url) {
         }
     }
 
-    if (bestMatch !== null && bestScore >= 50) {
+    // 閾値を20に下げる（先頭の文字列が少しでも一致すれば）
+    if (bestMatch !== null && bestScore >= 20) {
         const state = downloadState.get(bestMatch);
         state.downloadId = downloadId;
         downloadState.set(bestMatch, state);
         await saveStateToStorage();
-        console.log(`[Background] ✓ Matched download ${downloadId} -> tab ${bestMatch} (score: ${bestScore})`);
+        console.log(`[Background] ✓ MATCHED: download ${downloadId} -> tab ${bestMatch} (score: ${bestScore})`);
         return true;
     }
 
-    console.log(`[Background] ✗ No match found for download ${downloadId} (best score: ${bestScore})`);
+    console.log(`[Background] ✗ No match (best score: ${bestScore})`);
     return false;
 }
 
@@ -146,7 +194,6 @@ async function pollTabProgress(tabId) {
         if (results && results[0] && results[0].result) {
             const { status, progress } = results[0].result;
             const currentState = downloadState.get(tabId);
-
             if (!currentState) return;
 
             currentState.progress = progress;
@@ -208,51 +255,39 @@ function addToMonitoring(tabId) {
 // ============================================
 
 chrome.downloads.onCreated.addListener(async (downloadItem) => {
-    console.log('[Background] Download created:', {
-        id: downloadItem.id,
-        filename: downloadItem.filename,
-        url: downloadItem.url?.substring(0, 60)
-    });
+    console.log('[Background] Download created:', downloadItem.id);
 
-    // ファイル名がすぐに利用可能ならマッチング試行
     if (downloadItem.filename) {
         const matched = await matchDownloadToTab(downloadItem.id, downloadItem.filename, downloadItem.url);
         if (!matched) {
-            unmatchedDownloads.set(downloadItem.id, {
-                filename: downloadItem.filename,
-                url: downloadItem.url
-            });
+            unmatchedDownloads.set(downloadItem.id, { filename: downloadItem.filename, url: downloadItem.url });
         }
     } else {
-        // ファイル名が後で判明するのを待つ
-        unmatchedDownloads.set(downloadItem.id, {
-            filename: null,
-            url: downloadItem.url
-        });
+        unmatchedDownloads.set(downloadItem.id, { filename: null, url: downloadItem.url });
     }
 });
 
 chrome.downloads.onChanged.addListener(async (delta) => {
-    // ファイル名が確定したとき
+    // ファイル名が確定
     if (delta.filename && delta.filename.current) {
         const info = unmatchedDownloads.get(delta.id);
-        if (info) {
+        if (info && !info.filename) {
             console.log(`[Background] Filename determined for ${delta.id}: ${delta.filename.current}`);
+            info.filename = delta.filename.current;
             const matched = await matchDownloadToTab(delta.id, delta.filename.current, info.url);
             if (matched) {
                 unmatchedDownloads.delete(delta.id);
-            } else {
-                info.filename = delta.filename.current;
             }
         }
     }
 
     // 状態変化
     if (delta.state) {
+        // まず紐付け済みのダウンロードを探す
         for (const [tabId, state] of downloadState) {
             if (state.downloadId === delta.id) {
                 if (delta.state.current === 'complete') {
-                    console.log(`[Background] ✓ COMPLETE: download ${delta.id} -> tab ${tabId} "${state.title?.substring(0, 40)}"`);
+                    console.log(`[Background] ✓ COMPLETE: download ${delta.id} -> tab ${tabId}`);
                     updateTabState(tabId, 'complete', '');
                     monitoredTabs.delete(tabId);
                     unmatchedDownloads.delete(delta.id);
@@ -268,19 +303,19 @@ chrome.downloads.onChanged.addListener(async (delta) => {
             }
         }
 
-        // 紐付けされていないダウンロードが完了した場合、再度マッチング試行
+        // 未紐付けダウンロードが完了した場合、再マッチング試行
         if (delta.state.current === 'complete') {
             const info = unmatchedDownloads.get(delta.id);
             if (info && info.filename) {
-                console.log(`[Background] Unmatched download completed, trying to match: ${delta.id}`);
+                console.log(`[Background] Retrying match for completed download ${delta.id}`);
                 const matched = await matchDownloadToTab(delta.id, info.filename, info.url);
                 if (matched) {
-                    const state = [...downloadState.values()].find(s => s.downloadId === delta.id);
-                    if (state) {
-                        const tabId = [...downloadState.entries()].find(([_, s]) => s === state)?.[0];
-                        if (tabId) {
+                    // マッチ成功したら完了にする
+                    for (const [tabId, state] of downloadState) {
+                        if (state.downloadId === delta.id) {
                             updateTabState(tabId, 'complete', '');
                             monitoredTabs.delete(tabId);
+                            break;
                         }
                     }
                 }
