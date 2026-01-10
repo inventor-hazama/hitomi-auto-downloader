@@ -1,21 +1,15 @@
 // Background Service Worker
-// v2.1.0 - Chrome Downloads APIを使った正確な完了検出
+// v2.2.0 - タブとダウンロードIDの正確な紐付け
 
 // ============================================
-// State Management with chrome.storage.local
+// State Management
 // ============================================
 
-// メモリ内キャッシュ
-let downloadState = new Map();  // tabId -> { status, downloadId, details, progress, url, title }
-
-// 監視中のタブ
+let downloadState = new Map();  // tabId -> { status, downloadId, details, progress, url, title, galleryId }
 let monitoredTabs = new Set();
 let progressPollingInterval = null;
 
-// 直近でダウンロードボタンをクリックしたタブを追跡（順番にダウンロードIDを割り当て）
-let pendingDownloadTabs = [];
-
-// ステータスをストレージに保存
+// ストレージに保存
 async function saveStateToStorage() {
     const stateObject = {};
     for (const [tabId, state] of downloadState) {
@@ -24,7 +18,7 @@ async function saveStateToStorage() {
     await chrome.storage.local.set({ downloadState: stateObject });
 }
 
-// ストレージからステータスを復元
+// ストレージから復元
 async function loadStateFromStorage() {
     try {
         const result = await chrome.storage.local.get('downloadState');
@@ -39,11 +33,19 @@ async function loadStateFromStorage() {
     }
 }
 
-// 初期化
 loadStateFromStorage();
 
+// URLからギャラリーIDを抽出
+function extractGalleryId(url) {
+    if (!url) return null;
+    // hitomi.la/doujinshi/xxxxx-12345.html -> 12345
+    // hitomi.la/manga/title-here-67890.html -> 67890
+    const match = url.match(/-(\d+)\.html/);
+    return match ? match[1] : null;
+}
+
 // ============================================
-// Progress Polling from Background
+// Progress Polling
 // ============================================
 
 async function pollTabProgress(tabId) {
@@ -59,24 +61,18 @@ async function pollTabProgress(tabId) {
 
             if (!currentState) return;
 
-            // 現在の進捗を保存
             currentState.progress = progress;
 
             if (status === 'downloading' && hasProgressBar && progressBarVisible) {
-                // プログレスバーが表示されてダウンロード中
                 updateTabState(tabId, 'in-progress', `${progress}%`);
-                currentState.hadProgressBar = true;  // プログレスバーを見たことを記録
+                currentState.hadProgressBar = true;
             } else if (status === 'preparing') {
-                // ZIP準備中（プログレスバーが消えたがダウンロードIDがまだない）
                 if (currentState.hadProgressBar && !currentState.downloadId) {
                     updateTabState(tabId, 'in-progress', 'ZIP準備中...');
                 }
             }
-            // 注意: 完了判定はChrome Downloads APIに任せる
         }
     } catch (error) {
-        console.log(`[Background] Tab ${tabId} polling error:`, error.message);
-        // タブが閉じられた場合のみ監視を停止
         try {
             await chrome.tabs.get(tabId);
         } catch (e) {
@@ -106,7 +102,6 @@ function getProgressFromPage() {
     if (progressBarVisible && progress > 0) {
         return { status: 'downloading', progress, hasProgressBar, progressBarVisible };
     } else if (hasProgressBar && !progressBarVisible && !dlButtonVisible) {
-        // プログレスバーが存在するが非表示、ダウンロードボタンも非表示 → ZIP準備中
         return { status: 'preparing', progress: 100, hasProgressBar, progressBarVisible };
     } else if (dlButtonVisible) {
         return { status: 'ready', progress: 0, hasProgressBar, progressBarVisible };
@@ -137,49 +132,70 @@ function addToMonitoring(tabId) {
 }
 
 // ============================================
-// Chrome Downloads API - 正確な完了検出
+// Chrome Downloads API - 正確な紐付け
 // ============================================
 
-// ダウンロード作成時: タブとの紐付け
 chrome.downloads.onCreated.addListener(async (downloadItem) => {
-    // ZIPファイルかどうかチェック
-    const isZip = downloadItem.filename?.endsWith('.zip') ||
-        downloadItem.mime === 'application/zip' ||
-        downloadItem.url?.includes('.zip');
-
     console.log('[Background] Download created:', {
         id: downloadItem.id,
         url: downloadItem.url?.substring(0, 100),
-        filename: downloadItem.filename,
-        mime: downloadItem.mime,
-        isZip
+        filename: downloadItem.filename
     });
 
-    // 待機中のタブがあれば紐付け
-    if (pendingDownloadTabs.length > 0) {
-        const tabId = pendingDownloadTabs.shift();
-        const state = downloadState.get(tabId);
-        if (state && state.status === 'in-progress') {
-            state.downloadId = downloadItem.id;
-            downloadState.set(tabId, state);
-            await saveStateToStorage();
-            console.log(`[Background] Linked download ${downloadItem.id} to tab ${tabId}`);
-        }
-    } else {
-        // hitomi.laタブでin-progressかつdownloadIdがないものを探す
+    // ダウンロードURLまたはファイル名からギャラリーIDを抽出
+    const downloadGalleryId = extractGalleryIdFromDownload(downloadItem);
+
+    if (downloadGalleryId) {
+        // ギャラリーIDで照合
         for (const [tabId, state] of downloadState) {
-            if (state.status === 'in-progress' && !state.downloadId) {
+            if (state.status === 'in-progress' && !state.downloadId && state.galleryId === downloadGalleryId) {
                 state.downloadId = downloadItem.id;
                 downloadState.set(tabId, state);
                 await saveStateToStorage();
-                console.log(`[Background] Auto-linked download ${downloadItem.id} to tab ${tabId}`);
-                break;
+                console.log(`[Background] Matched download ${downloadItem.id} to tab ${tabId} by galleryId ${downloadGalleryId}`);
+                return;
             }
         }
     }
+
+    // ギャラリーIDで照合できない場合、in-progressで最も古いタブに割り当て
+    let oldestTab = null;
+    let oldestTime = Infinity;
+
+    for (const [tabId, state] of downloadState) {
+        if (state.status === 'in-progress' && !state.downloadId) {
+            if (state.startTime && state.startTime < oldestTime) {
+                oldestTime = state.startTime;
+                oldestTab = tabId;
+            }
+        }
+    }
+
+    if (oldestTab !== null) {
+        const state = downloadState.get(oldestTab);
+        state.downloadId = downloadItem.id;
+        downloadState.set(oldestTab, state);
+        await saveStateToStorage();
+        console.log(`[Background] Fallback: Linked download ${downloadItem.id} to oldest tab ${oldestTab}`);
+    }
 });
 
-// ダウンロード状態変化時: 完了/エラー検出
+function extractGalleryIdFromDownload(downloadItem) {
+    // URLからギャラリーID抽出を試みる
+    if (downloadItem.url) {
+        const urlMatch = downloadItem.url.match(/(\d{5,})/);
+        if (urlMatch) return urlMatch[1];
+    }
+
+    // ファイル名からギャラリーID抽出を試みる
+    if (downloadItem.filename) {
+        const filenameMatch = downloadItem.filename.match(/(\d{5,})/);
+        if (filenameMatch) return filenameMatch[1];
+    }
+
+    return null;
+}
+
 chrome.downloads.onChanged.addListener(async (delta) => {
     if (!delta.state) return;
 
@@ -223,7 +239,6 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
         case 'DOWNLOAD_CLICKED':
             if (sender.tab) {
-                pendingDownloadTabs.push(sender.tab.id);
                 const state = downloadState.get(sender.tab.id) || {};
                 state.hadProgressBar = false;
                 downloadState.set(sender.tab.id, state);
@@ -247,7 +262,6 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             return false;
 
         case 'DOWNLOAD_COMPLETE':
-            // Content scriptからの完了通知は無視（Downloads APIで判定）
             console.log('[Background] Ignoring DOWNLOAD_COMPLETE from content script');
             sendResponse({ success: true });
             return false;
@@ -317,14 +331,12 @@ async function startDownloadsFromShortcut() {
 }
 
 async function handleStartDownloads(tabIds, delay = 1000) {
-    // 既存の待機リストをクリア
-    pendingDownloadTabs = [];
-
     for (let i = 0; i < tabIds.length; i++) {
         const tabId = tabIds[i];
 
         try {
             const tab = await chrome.tabs.get(tabId);
+            const galleryId = extractGalleryId(tab.url);
 
             downloadState.set(tabId, {
                 status: 'in-progress',
@@ -333,13 +345,15 @@ async function handleStartDownloads(tabIds, delay = 1000) {
                 progress: 0,
                 url: tab.url,
                 title: tab.title,
-                hadProgressBar: false
+                galleryId: galleryId,
+                hadProgressBar: false,
+                startTime: Date.now()  // 開始時間を記録
             });
+
             broadcastStatusUpdate(tabId, 'in-progress', '処理中...');
             await saveStateToStorage();
 
-            // 待機リストに追加
-            pendingDownloadTabs.push(tabId);
+            console.log(`[Background] Starting download for tab ${tabId}, galleryId: ${galleryId}`);
 
             await chrome.scripting.executeScript({
                 target: { tabId: tabId },
@@ -359,28 +373,30 @@ async function handleStartDownloads(tabIds, delay = 1000) {
 }
 
 async function handleRetryDownloads(tabIds, delay = 2000) {
-    pendingDownloadTabs = [];
-
     for (let i = 0; i < tabIds.length; i++) {
         const tabId = tabIds[i];
 
         try {
-            downloadState.set(tabId, {
-                status: 'in-progress',
-                downloadId: null,
-                details: 'リロード中...',
-                progress: 0,
-                hadProgressBar: false
-            });
-            broadcastStatusUpdate(tabId, 'in-progress', 'リロード中...');
-            await saveStateToStorage();
-
             await chrome.tabs.reload(tabId);
             await sleep(3000);
 
-            pendingDownloadTabs.push(tabId);
+            const tab = await chrome.tabs.get(tabId);
+            const galleryId = extractGalleryId(tab.url);
+
+            downloadState.set(tabId, {
+                status: 'in-progress',
+                downloadId: null,
+                details: 'リロード完了...',
+                progress: 0,
+                url: tab.url,
+                title: tab.title,
+                galleryId: galleryId,
+                hadProgressBar: false,
+                startTime: Date.now()
+            });
 
             broadcastStatusUpdate(tabId, 'in-progress', 'ダウンロード開始...');
+            await saveStateToStorage();
 
             await chrome.scripting.executeScript({
                 target: { tabId: tabId },
